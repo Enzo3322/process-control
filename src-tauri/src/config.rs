@@ -6,10 +6,7 @@ use std::{
 
 use tauri::{AppHandle, Manager, Runtime};
 
-use crate::{
-    models::{ConfigSnapshot, LegacyPortsConfig, PortsConfig},
-    state::AppState,
-};
+use crate::{models::{ConfigSnapshot, PortsConfig}, state::AppState};
 
 const CONFIG_FILE_NAME: &str = "ports.json";
 
@@ -54,46 +51,12 @@ fn load_ports_config_from_path(path: &Path) -> Result<PortsConfig, String> {
 
     let content = fs::read_to_string(path)
         .map_err(|error| format!("Falha ao ler a configuracao de portas: {error}"))?;
-
-    match serde_json::from_str::<PortsConfig>(&content) {
-        Ok(config) => Ok(config),
-        Err(primary_error) => {
-            let legacy: LegacyPortsConfig = serde_json::from_str(&content).map_err(|_| {
-                format!(
-                    "Configuracao de portas invalida em {}: {primary_error}",
-                    path.display()
-                )
-            })?;
-
-            let migrated = migrate_legacy_config(legacy);
-            let migrated_content = serde_json::to_string_pretty(&migrated).map_err(|error| {
-                format!("Falha ao serializar a configuracao migrada: {error}")
-            })?;
-            fs::write(path, migrated_content)
-                .map_err(|error| format!("Falha ao salvar a configuracao migrada: {error}"))?;
-
-            Ok(migrated)
-        }
-    }
-}
-
-fn migrate_legacy_config(legacy: LegacyPortsConfig) -> PortsConfig {
-    let mut entries = legacy
-        .exact_ports
-        .into_iter()
-        .map(|port| port.to_string())
-        .collect::<Vec<_>>();
-
-    entries.extend(
-        legacy
-            .ranges
-            .into_iter()
-            .map(|range| format!("{}-{}", range.start, range.end)),
-    );
-
-    PortsConfig {
-        ports: entries.join(","),
-    }
+    serde_json::from_str::<PortsConfig>(&content).map_err(|error| {
+        format!(
+            "Configuracao de portas invalida em {}: {error}. Use o formato {{\"ports\":\"3000-3002,5432,6379\"}}.",
+            path.display()
+        )
+    })
 }
 
 fn parse_configured_ports(config: &PortsConfig) -> Result<BTreeSet<u16>, String> {

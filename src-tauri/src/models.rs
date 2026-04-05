@@ -16,18 +16,6 @@ impl Default for PortsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct LegacyPortRange {
-    pub(crate) start: u16,
-    pub(crate) end: u16,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct LegacyPortsConfig {
-    pub(crate) exact_ports: Vec<u16>,
-    pub(crate) ranges: Vec<LegacyPortRange>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessInfo {
     pub(crate) port: u16,
