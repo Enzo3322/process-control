@@ -9,10 +9,12 @@ use std::{
 };
 
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(target_os = "macos")]
+use objc2::MainThreadMarker;
 use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, Runtime,
 };
 
@@ -51,6 +53,12 @@ struct ProcessInfo {
     pid: u32,
     name: String,
     address: String,
+}
+
+#[derive(Debug, Clone)]
+struct DockerContainer {
+    id: String,
+    name: String,
 }
 
 #[derive(Debug, Default)]
@@ -251,6 +259,98 @@ fn terminate_process(pid: u32) -> Result<(), String> {
     }
 }
 
+fn terminate_target(port: u16, pid: u32) -> Result<(), String> {
+    if let Some(container) = docker_container_for_port(port)? {
+        return terminate_docker_container(&container);
+    }
+
+    if is_probably_docker_process(pid)? {
+        return Err(format!(
+            "A porta {port} parece estar publicada por Docker, mas nenhum container foi identificado com seguranca."
+        ));
+    }
+
+    terminate_process(pid)
+}
+
+fn docker_container_for_port(port: u16) -> Result<Option<DockerContainer>, String> {
+    let output = match Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            &format!("publish={port}"),
+            "--format",
+            "{{.ID}}\t{{.Names}}",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().find(|line| !line.trim().is_empty());
+    let Some(line) = line else {
+        return Ok(None);
+    };
+
+    let mut parts = line.split('\t');
+    let id = parts.next().unwrap_or_default().trim();
+    let name = parts.next().unwrap_or_default().trim();
+
+    if id.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(DockerContainer {
+        id: id.to_string(),
+        name: if name.is_empty() {
+            "container".to_string()
+        } else {
+            name.to_string()
+        },
+    }))
+}
+
+fn terminate_docker_container(container: &DockerContainer) -> Result<(), String> {
+    let status = Command::new("docker")
+        .args(["kill", &container.id])
+        .status()
+        .map_err(|error| {
+            format!(
+                "Falha ao encerrar o container Docker {}: {error}",
+                container.name
+            )
+        })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "O Docker recusou encerrar o container {}.",
+            container.name
+        ))
+    }
+}
+
+fn is_probably_docker_process(pid: u32) -> Result<bool, String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .map_err(|error| format!("Falha ao inspecionar o PID {pid}: {error}"))?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    let command = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    Ok(command.contains("docker"))
+}
+
 fn open_config_in_vscode(path: &Path) -> Result<(), String> {
     let status = Command::new("open")
         .args(["-a", "Visual Studio Code"])
@@ -407,7 +507,7 @@ fn build_process_submenu<R: Runtime>(
         )?;
         let kill = MenuItem::with_id(
             app,
-            format!("kill:{}", process.pid),
+            format!("kill:{}:{}", process.port, process.pid),
             "Encerrar processo",
             true,
             None::<&str>,
@@ -506,6 +606,43 @@ fn refresh_tray_with_message<R: Runtime>(app: &AppHandle<R>, message: &str) {
     }
 }
 
+fn schedule_refresh<R: Runtime>(app: AppHandle<R>, message: Option<String>) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(250));
+
+        match message {
+            Some(message) => refresh_tray_with_message(&app, &message),
+            None => {
+                if let Err(error) = refresh_tray(&app, None) {
+                    refresh_tray_with_message(&app, &error);
+                }
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn open_tray_menu<R: Runtime>(tray: &tauri::tray::TrayIcon<R>) -> Result<(), String> {
+    tray.with_inner_tray_icon(|inner| {
+        let Some(status_item) = inner.ns_status_item() else {
+            return Err("Nao foi possivel acessar o item da menubar.".to_string());
+        };
+
+        unsafe {
+            let mtm = MainThreadMarker::new().ok_or_else(|| {
+                "Nao foi possivel acessar a main thread do macOS.".to_string()
+            })?;
+            let button = status_item
+                .button(mtm)
+                .ok_or_else(|| "Nao foi possivel acessar o botao da menubar.".to_string())?;
+            button.performClick(None);
+        }
+
+        Ok(())
+    })
+    .map_err(|error| format!("Falha ao abrir o menu da menubar: {error}"))?
+}
+
 fn create_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let initial_menu = build_tray_menu(app, &[], Some("Carregando portas..."))?;
 
@@ -513,8 +650,27 @@ fn create_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .menu(&initial_menu)
         .title("Ports")
         .tooltip("Process Control")
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(false)
         .icon_as_template(true)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Down,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Err(error) = refresh_tray(app, None) {
+                    refresh_tray_with_message(app, &error);
+                    return;
+                }
+
+                #[cfg(target_os = "macos")]
+                if let Err(error) = open_tray_menu(tray) {
+                    refresh_tray_with_message(app, &error);
+                }
+            }
+        })
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
 
@@ -525,7 +681,7 @@ fn create_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                     .and_then(|path| open_config_in_vscode(&path))
                 {
                     Ok(()) => {}
-                    Err(error) => refresh_tray_with_message(app, &error),
+                    Err(error) => schedule_refresh(app.clone(), Some(error)),
                 }
                 return;
             }
@@ -535,17 +691,16 @@ fn create_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 return;
             }
 
-            if let Some(pid) = id
+            if let Some((port, pid)) = id
                 .strip_prefix("kill:")
-                .and_then(|value| value.parse::<u32>().ok())
+                .and_then(|value| {
+                    let (port, pid) = value.split_once(':')?;
+                    Some((port.parse::<u16>().ok()?, pid.parse::<u32>().ok()?))
+                })
             {
-                match terminate_process(pid) {
-                    Ok(()) => {
-                        if let Err(error) = refresh_tray(app, None) {
-                            refresh_tray_with_message(app, &error);
-                        }
-                    }
-                    Err(error) => refresh_tray_with_message(app, &error),
+                match terminate_target(port, pid) {
+                    Ok(()) => schedule_refresh(app.clone(), None),
+                    Err(error) => schedule_refresh(app.clone(), Some(error)),
                 }
             }
         })
