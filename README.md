@@ -40,3 +40,6 @@ npm run tauri dev
 Se alguma coisa estiver usando a porta errada, a app mostra.
 Se for Docker, ela tenta não fazer cagada.
 Se for processo local, ela mete `kill -9` sem terapia. 
+
+<img width="626" height="396" alt="CleanShot 2026-04-08 at 21 17 50@2x" src="https://github.com/user-attachments/assets/c43652b9-6a8a-4505-bc16-66d13b5a5eb4" />
+
